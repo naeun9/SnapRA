@@ -1,0 +1,45 @@
+# ---- 환경변수 / 비밀값 ----
+.env
+.env.*
+!.env.example
+
+# ---- 데이터 (절대 커밋 금지) ----
+# data/ 로 디렉터리째 제외하면 git 이 안으로 내려가지 않아 .gitkeep 예외가 안 먹는다.
+data/**
+!data/raw/
+!data/raw/.gitkeep
+!data/processed/
+!data/processed/.gitkeep
+
+# ---- 압축/분할 파일 ----
+*.zip
+*.z[0-9][0-9]
+*.tar
+*.tar.gz
+*.7z
+*.part
+*.part*
+
+# ---- AI-Hub CLI 및 조회 결과 ----
+aihubshell
+list.txt
+files_*.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- OS / 에디터 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

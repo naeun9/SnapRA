@@ -1,0 +1,8 @@
+# 데이터 파싱/집계
+pandas>=2.0
+pyarrow>=14.0        # parquet 캐시용 (없으면 csv 로 자동 폴백)
+tqdm>=4.66           # 22만 건 순회 진행률
+python-dotenv>=1.0   # .env 로드
+
+# 선택: tests/ 실행용. 없으면 python tests/test_tables.py 로 단독 실행된다.
+pytest>=8.0
