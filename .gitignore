@@ -43,3 +43,7 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+filekeys_*
+
+# 실행 로그 (다운로드/파싱 진행 기록)
+*.log

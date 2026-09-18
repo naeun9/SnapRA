@@ -13,6 +13,14 @@ RAW_DIR="$ROOT_DIR/data/raw"
 SHELL_BIN="$ROOT_DIR/aihubshell"
 SHELL_URL="https://api.aihub.or.kr/api/aihubshell.do"
 
+# aihubshell 25.09.19 v0.6 의 merge_parts() 는 분할 파일 prefix 를 printf '%q' 로
+# 이스케이프한 뒤 find -name 에 넘긴다. LANG 이 비어 있으면 bash 가 한글을
+# $'\354\240\225...' 형태로 escape 하므로 find 가 한 건도 못 찾고, 0바이트 파일을
+# 만든 다음 줄의 rm 이 part 파일을 지워 버린다 (데이터 소실).
+# UTF-8 로케일에서는 %q 가 한글을 그대로 두므로 반드시 고정해서 실행한다.
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+export LANG="${LANG:-C.UTF-8}"
+
 log()  { printf '%s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -29,6 +37,9 @@ usage() {
   ./scripts/download.sh get <datasetkey> <filekey[,filekey,...]>
       선택한 파일만 data/raw/ 밑으로 내려받는다.
       filekey 에 all 을 주면 데이터셋 전체(수백 GB)를 받는다. 주의.
+
+  ./scripts/download.sh unzip
+      data/raw/ 의 zip 을 한글 파일명 보존해서 푼다.
 
 예시:
   ./scripts/download.sh list
@@ -145,9 +156,44 @@ cmd_get() {
   # aihubshell 은 현재 디렉터리에 내려받는다. 서브셸에서 cd 한다.
   ( cd "$RAW_DIR" && "$SHELL_BIN" -aihubapikey "$AIHUB_API_KEY" -mode d -datasetkey "$key" -filekey "$filekeys" ) \
     || die "다운로드 실패"
+  verify_download
+}
+
+# 병합 결과를 믿지 않는다. 0바이트 zip 이나 남은 part 가 있으면 크게 알린다.
+verify_download() {
+  zips=$(find "$RAW_DIR" -name '*.zip' 2>/dev/null | wc -l | tr -d ' ')
+  empty=$(find "$RAW_DIR" -name '*.zip' -size 0 2>/dev/null | wc -l | tr -d ' ')
+  parts=$(find "$RAW_DIR" -name '*.part*' 2>/dev/null | wc -l | tr -d ' ')
+
   log ""
-  log "완료. 분할 파일(.part*)이 있으면 합친 뒤 풀어라:"
-  log "  cd data/raw && cat <name>.zip.part* > <name>.zip && unzip -O cp949 <name>.zip"
+  log "zip $zips 개 / 0바이트 $empty 개 / 남은 part $parts 개"
+
+  if [ "$empty" -gt 0 ]; then
+    log ""
+    log "경고: 0바이트 zip 이 $empty 개다. aihubshell 의 분할 파일 병합이 실패했다."
+    log "  한글 파일명 + 비UTF-8 로케일 조합에서 생기는 문제로, 이 스크립트는"
+    log "  LC_ALL=C.UTF-8 을 고정하므로 정상이라면 나오지 않는다."
+    log "  0바이트 파일을 지우고 다시 받아라 (part 파일은 이미 삭제되어 복구 불가)."
+    return 1
+  fi
+
+  if [ "$parts" -gt 0 ]; then
+    log ""
+    log "병합되지 않은 분할 파일이 남았다. 직접 합쳐라:"
+    log "  cd data/raw && cat <name>.zip.part* > <name>.zip"
+    return 1
+  fi
+
+  log "다음: bash scripts/download.sh unzip"
+  return 0
+}
+
+# zip 안의 한글 파일명이 깨지지 않게 푼다. AI-Hub zip 은 cp949 이름이 섞여 있다.
+cmd_unzip() {
+  [ -d "$RAW_DIR" ] || die "$RAW_DIR 가 없다."
+  py=$(command -v python || command -v python3) || die "python 이 필요하다."
+  log "data/raw 의 zip 을 푼다 (한글 파일명 보존)"
+  "$py" "$SCRIPT_DIR/extract_zips.py" "$RAW_DIR"
 }
 
 # ------------------------------------------------------------------- main
@@ -158,6 +204,7 @@ case "$sub" in
   list)  load_env; ensure_shell; cmd_list ;;
   files) load_env; ensure_shell; cmd_files "${1:-}" ;;
   get)   load_env; ensure_shell; cmd_get "${1:-}" "${2:-}" ;;
+  unzip) cmd_unzip ;;
   ""|-h|--help|help) usage; exit 0 ;;
   *)     usage; die "알 수 없는 서브커맨드: $sub" ;;
 esac

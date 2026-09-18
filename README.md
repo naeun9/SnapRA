@@ -36,8 +36,12 @@
 ├── src/config.py         경로·환경변수
 ├── src/schema.py         JSON 어노테이션 스키마 — 테이블은 tables.py 에서 읽어 온다
 ├── src/parse_labels.py   JSON 일괄 파싱 → DataFrame → 분포 리포트
+├── src/make_evalset.py   Validation 분할에서 VLM 평가셋 생성
+├── scripts/fetch_eval_images.py  평가셋 이미지만 순차 스트리밍으로 확보
 ├── tests/test_tables.py  tables.py 개수·정합성 검증
 ├── tests/make_fixture.py 실데이터 없이 돌려보는 가짜 라벨 생성기
+├── docs/dataset-card.md  실측 데이터 카드 (결과보고서 인용용)
+├── docs/aihubshell-bug.md  AI-Hub CLI 병합 버그 기록
 └── data/
     ├── raw/              내려받은 원본 (git 제외)
     └── processed/        캐시·리포트 (git 제외)
@@ -182,6 +186,34 @@ python src/parse_labels.py --workers 8    # 병렬 파싱 (기본: CPU 절반)
 촬영장비 분포를 특히 눈여겨볼 것. 서비스 입력은 현장 작업자의 휴대폰 사진이므로,
 휴대폰(`device=4`) 촬영분이 평가셋의 현실성을 좌우한다. 드론·CCTV 시점 이미지에서 잘 맞는
 프롬프트가 휴대폰 사진에서도 맞는다는 보장은 없다.
+
+## 평가셋
+
+라벨 파싱이 끝나면 Validation 분할(22,600장)에서만 평가셋을 뽑는다. Training 180,800장은
+쓰지 않으므로 "학습에 사용되지 않은 데이터로 평가했다"가 데이터 분할로 보장된다.
+
+```bash
+python src/make_evalset.py -n 50 --mobile-all   # 시드 20260918 고정
+```
+
+| 세트 | 장수 | 종수 | 용도 |
+| --- | --- | --- | --- |
+| `eval_main` | 5,650 | 113 | 종당 50장. 주 평가셋 |
+| `eval_mobile` | 3,426 | 25 | Validation 휴대폰 전수. 실사용 조건 |
+| `eval_smoke` | 226 | 113 | 파이프라인 점검용 |
+
+### 이미지 확보
+
+원천 이미지는 Validation 만 27 GB 인데 실제로 필요한 것은 합집합 8,194장(약 10 GB)이다.
+zip 하나(최대 408 MB)씩 받아 필요한 이미지만 꺼내고 zip 은 바로 버린다.
+
+```bash
+python scripts/fetch_eval_images.py --dry-run   # 계획만
+python scripts/fetch_eval_images.py             # 실행 (중단해도 이어서 받는다)
+```
+
+진행 상태는 `data/raw/images/_progress.json` 에 남아 재시작 시 끝난 zip 을 건너뛴다.
+Training 원천데이터(226 GB)는 받지 않는다.
 
 ## 코드 테이블
 

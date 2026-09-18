@@ -197,6 +197,13 @@ def write_report(df: pd.DataFrame, name: str) -> None:
 # 코드값만 있는 리포트는 읽을 수 없다. 모든 집계에 tables.py 의 명칭을 붙인다.
 NONE_LABEL = "(없음)"
 
+# 설명서의 시나리오당 2,000장은 구축 총량(Training 1,600 + Validation 200 + Test 200)
+# 기준이고, AI-Hub 가 공개 배포하는 것은 Test 10% 를 뺀 90% 다. 실측 결과 113종
+# 전부 1,800장으로 이 비율과 정확히 맞는다. 기대값 비교는 공개분 기준으로 한다.
+# tables.EXPECTED_PER_SCENARIO(2,000)는 코드 정의표의 값이므로 건드리지 않는다.
+PUBLIC_SPLIT_RATIO = 0.9
+EXPECTED_PER_SCENARIO_PUBLIC = int(schema.EXPECTED_PER_SCENARIO * PUBLIC_SPLIT_RATIO)
+
 
 def _codes(series: pd.Series) -> pd.Series:
     """NaN/빈 문자열을 (없음) 으로 통일한 문자열 시리즈."""
@@ -261,6 +268,7 @@ def scenario_report(df: pd.DataFrame) -> pd.DataFrame:
         "situation_id",
         "n_images",
         "diff_from_expected",
+        "category",
         "situation_type",
         "situation_type_ko",
         "is_normal",
@@ -299,9 +307,12 @@ def scenario_report(df: pd.DataFrame) -> pd.DataFrame:
     grouped["process_id"] = sid.map(schema.scenario_process_id)
     grouped["process_name"] = grouped["process_id"].map(schema.process_name)
     grouped["is_normal"] = sid.map(schema.is_normal)
-    grouped["description"] = sid.map(schema.describe)
+    # SO-nn(안전보조장비)은 시나리오가 아니므로 category 로 갈라 둔다. class_ID 의
+    # SO-nn 과 코드가 겹치지만 여기 값은 전부 Situation_ID 에서 온 것이다.
+    grouped["category"] = sid.map(schema.situation_category)
+    grouped["description"] = sid.map(schema.situation_label)
     grouped["in_tables"] = sid.map(schema.is_known_situation)
-    grouped["diff_from_expected"] = grouped["n_images"] - schema.EXPECTED_PER_SCENARIO
+    grouped["diff_from_expected"] = grouped["n_images"] - EXPECTED_PER_SCENARIO_PUBLIC
     # 기대값과 다른 type_ID 가 하나라도 섞여 있으면 불일치로 본다.
     grouped["code_mismatch"] = [
         bool(exp) and bool(got) and any(t != exp for t in got.split("|"))
@@ -318,7 +329,7 @@ def scenario_report(df: pd.DataFrame) -> pd.DataFrame:
 def pair_report(df: pd.DataFrame) -> pd.DataFrame:
     """Y-nn 과 N-nn 의 장수가 짝을 이루는지 + 각각 2,000장 기준과의 차이."""
     counts = _codes(df["situation_id"]).value_counts().to_dict() if not df.empty else {}
-    expected = schema.EXPECTED_PER_SCENARIO
+    expected = EXPECTED_PER_SCENARIO_PUBLIC
     rows = []
     for y_id, n_id in schema.SCENARIO_PAIRS:
         y_n = int(counts.get(y_id, 0))
@@ -353,7 +364,10 @@ def pair_report(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def missing_scenario_report(df: pd.DataFrame) -> pd.DataFrame:
-    """tables.py 에 정의된 105개 중 데이터에 아예 없는 situation_id."""
+    """SCENARIOS(105개) 중 데이터에 아예 없는 situation_id.
+
+    안전보조장비(SO-nn)는 SCENARIOS 에 없으므로 여기 대상이 아니다.
+    """
     present = set(_codes(df["situation_id"])) if not df.empty else set()
     rows = []
     for sid in schema.DEFINED_SITUATION_IDS:
@@ -435,22 +449,35 @@ def missing_class_report(classes: pd.DataFrame) -> pd.DataFrame:
 def unknown_codes_report(
     labels_df: pd.DataFrame, objects_df: pd.DataFrame
 ) -> pd.DataFrame:
-    """tables.py 에 정의되지 않은 situation_id / class_id 를 모아 둔다."""
+    """테이블로 설명되지 않는 situation_id / class_id 만 모은다.
+
+    안전보조장비(Situation_ID 가 SO-nn)는 SCENARIOS 에 없지만 정의된 계열이므로
+    이상으로 잡지 않는다. class_ID 의 SO-nn 과 코드가 겹치더라도, 여기서는 값이
+    어느 필드에서 왔는지로 갈라 판정한다.
+    """
     rows: list[dict[str, Any]] = []
 
     if not labels_df.empty:
+        # Situation_ID 문맥
         for code, n in _codes(labels_df["situation_id"]).value_counts().items():
-            if code == NONE_LABEL:
+            category = (
+                schema.CATEGORY_MISSING
+                if code == NONE_LABEL
+                else schema.situation_category(code)
+            )
+            if category == schema.CATEGORY_MISSING:
                 rows.append({"kind": "situation_id", "code": "(비어 있음)", "count": int(n), "unit": "images", "note": "Situation_ID 누락"})
-            elif not schema.is_known_situation(code):
-                rows.append({"kind": "situation_id", "code": code, "count": int(n), "unit": "images", "note": "SCENARIOS 에 없음"})
+            elif category == schema.CATEGORY_UNDEFINED:
+                rows.append({"kind": "situation_id", "code": code, "count": int(n), "unit": "images", "note": "SCENARIOS 에도 없고 안전보조장비(SO-nn)도 아님"})
+            # CATEGORY_SCENARIO / CATEGORY_SAFETY_EQUIP 는 정상
 
     if not objects_df.empty:
+        # class_ID 문맥
         for code, n in _codes(objects_df["class_id"]).value_counts().items():
             if code == NONE_LABEL:
                 rows.append({"kind": "class_id", "code": "(비어 있음)", "count": int(n), "unit": "annotations", "note": "class_ID 누락"})
                 continue
-            # 시나리오 ID 로 달린 bbox 는 정상이다. 객체도 시나리오도 아닌 값만 이상.
+            # 객체 클래스이거나, 상황 bbox 로 달린 시나리오 ID 면 정상.
             if schema.is_known_class(code) or schema.is_known_situation(code):
                 continue
             if str(code).upper() in schema.MISSING_CLASS_IDS:
@@ -577,7 +604,7 @@ def mobile_subset_text(labels_df: pd.DataFrame) -> str:
     ]
     counts = _codes(mobile["situation_id"]).value_counts()
     for sid, count in counts.items():
-        lines.append(f"  {str(sid):<14}{int(count):>8,}  {schema.describe(sid)}")
+        lines.append(f"  {str(sid):<14}{int(count):>8,}  {schema.situation_label(sid)}")
 
     absent = [
         sid
@@ -612,6 +639,7 @@ def build_summary(
         return {str(k): int(v) for k, v in _codes(labels_df[col]).value_counts().items()}
 
     situ = dist("situation_type")
+    categories = dist("situation_category")
     types = dist("type_id")
     processes = dist("process_id")
     devices = dist("device")
@@ -653,7 +681,8 @@ def build_summary(
         if code not in situ:
             continue
         name = schema.SITUATION_TYPE_KO.get(code, "(미정의)")
-        L.append(f"  {code} {name:<12} {situ[code]:>9,}  {pct(situ[code])}")
+        note = "  (판정 대상 아님, type_ID=G)" if code == schema.SAFETY_EQUIP_PREFIX else ""
+        L.append(f"  {code} {name:<12} {situ[code]:>9,}  {pct(situ[code])}{note}")
     for code, n in situ.items():
         if code not in ("Y", "N", "C", "SO"):
             L.append(f"  {code} {'(미정의)':<12} {n:>9,}  {pct(n)}")
@@ -661,6 +690,10 @@ def build_summary(
     if normal_counts:
         L.append("  -- tables.is_normal() 기준 --")
         for label, n in normal_counts.items():
+            L.append(f"  {label:<24} {n:>9,}  {pct(n)}")
+    if categories:
+        L.append("  -- Situation_ID 분류 --")
+        for label, n in categories.items():
             L.append(f"  {label:<24} {n:>9,}  {pct(n)}")
     L.append("")
     # 4. 공정별
@@ -723,7 +756,7 @@ def build_summary(
         else pairs
     )
     L.append(
-        f"  기준 {schema.EXPECTED_PER_SCENARIO:,}장과 다른 시나리오가 있는 쌍: "
+        f"  공개분 기준 {EXPECTED_PER_SCENARIO_PUBLIC:,}장과 다른 시나리오가 있는 쌍: "
         f"{len(off_expected)} (상세: pair_check.csv)"
     )
     L.append("")
@@ -752,13 +785,15 @@ def build_summary(
         )
     if len(errors_df):
         anomalies.append(f"파싱 실패 {len(errors_df):,} 건 (parse_errors.csv)")
-    mismatch_codes = (
-        int(labels_df.get("known_situation", pd.Series(dtype=bool)).eq(False).sum())
-        if total
-        else 0
-    )
-    if mismatch_codes:
-        anomalies.append(f"tables.py 에 없는 situation_id 를 가진 이미지 {mismatch_codes:,} 장")
+    # 안전보조장비(SO-nn)는 SCENARIOS 에 없는 게 정상이므로 이상으로 세지 않는다.
+    undefined_images = int(categories.get(schema.CATEGORY_UNDEFINED, 0))
+    missing_situation_images = int(categories.get(schema.CATEGORY_MISSING, 0))
+    if undefined_images:
+        anomalies.append(
+            f"시나리오도 안전보조장비도 아닌 situation_id 를 가진 이미지 {undefined_images:,} 장"
+        )
+    if missing_situation_images:
+        anomalies.append(f"Situation_ID 가 비어 있는 이미지 {missing_situation_images:,} 장")
     if anomalies:
         for line in anomalies:
             L.append(f"  - {line}")
@@ -775,9 +810,12 @@ def build_summary(
         "n_defined_situation_ids": len(schema.DEFINED_SITUATION_IDS),
         "n_object_classes_seen": int(len(object_classes)),
         "n_object_classes_defined": len(schema.OBJECT_CLASSES),
-        "expected_per_scenario": schema.EXPECTED_PER_SCENARIO,
+        "expected_per_scenario_spec": schema.EXPECTED_PER_SCENARIO,
+        "expected_per_scenario_public": EXPECTED_PER_SCENARIO_PUBLIC,
+        "public_split_ratio": PUBLIC_SPLIT_RATIO,
         "by_accident_type": types,
         "by_situation_type": situ,
+        "by_situation_category": categories,
         "by_is_normal": _normal_counts(labels_df),
         "by_process": processes,
         "by_device": devices,
@@ -865,12 +903,11 @@ def run(
     write_report(shape_report(objects_df), "annotation_shape_counts")
     write_report(pairs, "pair_check")
     write_report(missing_scenarios, "missing_scenarios")
-    if len(missing_classes):
-        write_report(missing_classes, "missing_class_hits")
-    if len(unknown_codes):
-        write_report(unknown_codes, "unknown_codes")
-    if len(errors_df):
-        write_report(errors_df, "parse_errors")
+    # 빈 결과도 "아무것도 안 잡혔다"는 증거이므로 항상 덮어쓴다.
+    # (조건부로 쓰면 이전 실행의 파일이 남아 실데이터 결과로 오인된다)
+    write_report(missing_classes, "missing_class_hits")
+    write_report(unknown_codes, "unknown_codes")
+    write_report(errors_df, "parse_errors")
 
     mobile_text = mobile_subset_text(labels_df)
     (config.REPORT_DIR / "mobile_subset.txt").write_text(mobile_text, encoding="utf-8")

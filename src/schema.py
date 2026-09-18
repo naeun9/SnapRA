@@ -7,6 +7,13 @@ JSON 한 건 = 이미지 한 장의 라벨. 최상위 키에 마침표가 붙어
 파싱 실패는 예외 대신 None 으로 흘린다 — 22만 건을 훑는 중에 한 건 때문에
 멈추면 곤란하기 때문.
 
+주의 — `SO` 접두어는 필드에 따라 뜻이 다르다. `Raw_Data_Info.Situation_ID` 의
+'SO-35' 는 안전보조장비 촬영분(type_ID = G)이고, `Annotations[].class_ID` 의
+'SO-35' 는 정적 객체 클래스(PE 안전 펜스)다. 실제 데이터에서 두 값은 같은 코드를
+공유하므로(SO-35, SO-41~SO-47) 문자열 패턴이 아니라 **어느 필드에서 온 값인지**로
+갈라야 한다. 함수 이름이 그 구분을 표시한다 — `situation_*` 는 Situation_ID 전용,
+`object_class_*` 는 class_ID 전용.
+
 코드 테이블(시나리오 105개, 객체 클래스 73종, 공정, 사고유형, 날씨, 촬영장비,
 실내외, 결번, 안전쌍)의 단일 출처는 tables.py 다. 이 파일은 테이블을 정의하지
 않고 tables.py 를 읽어 쓰기 좋은 형태로 노출하는 역할만 한다. Enum 으로 남은
@@ -271,7 +278,72 @@ def scenario_process_id(situation_id: str | None) -> str:
 
 
 def is_known_situation(situation_id: str | None) -> bool:
+    """SCENARIOS(105개)에 있는 시나리오인지. 안전보조장비(SO-nn)는 False 다."""
     return scenario_entry(situation_id) is not None
+
+
+# ------------------------------------------- 안전보조장비 (SO 접두어 충돌 처리)
+# 주의: 'SO-35' 는 문맥에 따라 뜻이 다르다.
+#   Raw_Data_Info.Situation_ID == 'SO-35'   -> 안전보조장비 촬영분 (type_ID = G)
+#   Annotations[].class_ID     == 'SO-35'   -> 정적 객체 클래스 (PE 안전 펜스)
+# 실제 데이터에서 두 값은 같은 코드를 공유한다 (SO-35, SO-41~SO-47 8종).
+# 따라서 문자열만 보고 판단하면 안 되고, **어느 필드에서 온 값인지**로 갈라야 한다.
+# 이 파일의 함수는 이름으로 그 구분을 표시한다.
+#   situation_* / is_safety_equip_situation : Situation_ID 전용
+#   object_class_* / is_known_class         : class_ID 전용
+# 안전보조장비는 정상/비정상 판정 대상이 아니라서 SCENARIOS 에 없다 (의도된 설계).
+SAFETY_EQUIP_PREFIX = "SO"
+
+# situation_category() 가 돌려주는 값
+CATEGORY_SCENARIO = "시나리오"
+CATEGORY_SAFETY_EQUIP = "안전보조장비"
+CATEGORY_UNDEFINED = "미정의"
+CATEGORY_MISSING = "값 없음"
+
+
+def is_safety_equip_situation(situation_id: str | None) -> bool:
+    """Situation_ID 가 안전보조장비(SO-nn)인지. class_ID 에 쓰면 안 된다.
+
+    접두어만 보지 않고 같은 코드가 OBJECT_CLASSES 에 있는지까지 확인한다.
+    SO-99 처럼 테이블에 없는 코드는 안전보조장비로 인정하지 않고 미정의로 남긴다.
+    """
+    if situation_prefix(situation_id) != SAFETY_EQUIP_PREFIX:
+        return False
+    return is_known_class(situation_id)
+
+
+def situation_category(situation_id: str | None) -> str:
+    """Situation_ID 를 네 갈래로 분류한다. 리포트의 분류 기준.
+
+    시나리오       — SCENARIOS 105개 (Y/N/C). 정상/비정상 판정 대상
+    안전보조장비   — SO-nn. type_ID = G. 판정 대상이 아니므로 SCENARIOS 에 없다
+    미정의         — 어느 쪽도 아닌 코드. 진짜 이상 신호
+    값 없음        — Situation_ID 누락
+    """
+    if not isinstance(situation_id, str) or not situation_id.strip():
+        return CATEGORY_MISSING
+    if is_known_situation(situation_id):
+        return CATEGORY_SCENARIO
+    if is_safety_equip_situation(situation_id):
+        return CATEGORY_SAFETY_EQUIP
+    return CATEGORY_UNDEFINED
+
+
+def situation_label(situation_id: str | None) -> str:
+    """Situation_ID 의 사람이 읽을 설명.
+
+    시나리오는 describe() 가 만든 '사고유형 · 공정 · 설명'.
+    안전보조장비는 시나리오 설명이 없으므로 같은 코드의 객체 클래스 명칭을 쓴다
+    (SO-35 -> '안전보조장비 · PE 안전 펜스').
+    """
+    label = describe(situation_id)
+    if label:
+        return label
+    if is_safety_equip_situation(situation_id):
+        name = object_class_name(situation_id)
+        prefix = SITUATION_TYPE_KO.get(SAFETY_EQUIP_PREFIX, "안전보조장비")
+        return f"{prefix} · {name}" if name else prefix
+    return ""
 
 
 def accident_type_name(type_id: str | None) -> str:
@@ -536,8 +608,10 @@ class LabelRecord:
             "situation_type": r.situation_type,
             "situation_type_ko": r.situation_type_ko,
             "is_normal": is_normal(r.Situation_ID),
+            # SO-nn 은 class_ID 와 코드가 겹치므로 Situation_ID 문맥 전용 함수로 분류한다.
+            "situation_category": situation_category(r.Situation_ID),
             "scenario_desc": scenario_description(r.Situation_ID),
-            "scenario_label": describe(r.Situation_ID),
+            "situation_label": situation_label(r.Situation_ID),
             "known_situation": is_known_situation(r.Situation_ID),
             "type_id": r.type_ID,
             "type_ko": r.accident_type_ko or r.Type_Description,
