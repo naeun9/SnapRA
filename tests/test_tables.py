@@ -132,14 +132,48 @@ def test_safety_pairs_have_judgement_item() -> None:
 
 
 # --------------------------------------------------------------- 코드값
+def _keys(mapping: dict) -> set[str]:
+    """코드 키를 문자열로 정규화. DEVICES 는 int 키를 쓴다."""
+    return {str(k).strip() for k in mapping}
+
+
 def test_code_tables() -> None:
-    assert tables.EXPECTED_PER_SCENARIO == 2000
+    assert tables.EXPECTED_PER_SCENARIO == 2000, tables.EXPECTED_PER_SCENARIO
     assert len(tables.PROCESSES) == 17, f"공정 {len(tables.PROCESSES)}종 (기대 17)"
-    assert set(tables.SITE_CONDITIONS) == {"1", "2"}
-    assert set(tables.WEATHER) == {"1", "2", "3", "4"}
-    assert set(tables.DEVICES) == {"1", "2", "3", "4", "5"}
-    assert set("ABCDEFG") <= set(tables.ACCIDENT_TYPES)
-    assert {"Y", "N", "C"} <= set(tables.SITUATION_PREFIX)
+    assert _keys(tables.SITE_CONDITIONS) == {"1", "2"}, _keys(tables.SITE_CONDITIONS)
+    assert _keys(tables.WEATHER) == {"1", "2", "3", "4"}, _keys(tables.WEATHER)
+    assert _keys(tables.DEVICES) == {"1", "2", "3", "4", "5"}, _keys(tables.DEVICES)
+    assert set("ABCDEFG") <= _keys(tables.ACCIDENT_TYPES), _keys(tables.ACCIDENT_TYPES)
+    assert {"Y", "N", "C"} <= _keys(tables.SITUATION_PREFIX), _keys(tables.SITUATION_PREFIX)
+    empty = [k for k, v in tables.PROCESSES.items() if not str(v).strip()]
+    assert not empty, f"명칭이 빈 공정: {empty}"
+
+
+# --------------------------------------------------------------- 헬퍼 함수
+def test_scenario_pair_helper() -> None:
+    """Y-nn <-> N-nn 을 왕복하고, 쌍이 없는 코드는 None 을 준다."""
+    for y_id in _ids("Y"):
+        n_id = tables.scenario_pair(y_id)
+        assert n_id == "N-" + y_id.split("-", 1)[1], f"{y_id} -> {n_id}"
+        assert tables.scenario_pair(n_id) == y_id, f"{n_id} -> 왕복 실패"
+    for c_id in _ids("C"):
+        assert tables.scenario_pair(c_id) is None, f"{c_id} 에 쌍이 생겼다"
+
+
+def test_is_normal_helper() -> None:
+    """Y 는 True, N 은 False, 쌍이 없는 C 는 None."""
+    assert all(tables.is_normal(sid) is True for sid in _ids("Y"))
+    assert all(tables.is_normal(sid) is False for sid in _ids("N"))
+    assert all(tables.is_normal(sid) is None for sid in _ids("C"))
+
+
+def test_describe_helper() -> None:
+    """설명은 '사고유형 · 공정 · 설명' 형태로, 세 조각을 모두 담는다."""
+    for sid, (type_id, process_id, desc) in tables.SCENARIOS.items():
+        text = tables.describe(sid)
+        assert desc in text, f"{sid}: 설명 누락 -> {text}"
+        assert tables.ACCIDENT_TYPES[type_id] in text, f"{sid}: 사고유형 누락 -> {text}"
+        assert tables.PROCESSES[process_id] in text, f"{sid}: 공정 누락 -> {text}"
 
 
 # -------------------------------------------------- schema.py 연동 확인

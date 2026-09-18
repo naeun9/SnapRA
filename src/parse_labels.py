@@ -203,6 +203,26 @@ def _codes(series: pd.Series) -> pd.Series:
     return series.astype("object").where(series.notna(), NONE_LABEL).replace("", NONE_LABEL)
 
 
+def _normal_counts(df: pd.DataFrame) -> dict[str, int]:
+    """tables.is_normal() 기준 정상/비정상/판정 없음 집계.
+
+    Y/N 은 True/False, 쌍이 없는 C·SO 와 미정의 코드는 None 이 된다.
+    """
+    if df.empty:
+        return {}
+    flags = (
+        df["is_normal"]
+        if "is_normal" in df.columns
+        else _codes(df["situation_id"]).map(schema.is_normal)
+    )
+    labels = flags.map(
+        lambda v: "정상(Y)" if v is True else ("비정상(N)" if v is False else "판정 없음(C/SO/미정의)")
+    )
+    order = ["정상(Y)", "비정상(N)", "판정 없음(C/SO/미정의)"]
+    counts = labels.value_counts().to_dict()
+    return {k: int(counts[k]) for k in order if k in counts}
+
+
 def value_counts_report(
     df: pd.DataFrame,
     col: str,
@@ -243,6 +263,7 @@ def scenario_report(df: pd.DataFrame) -> pd.DataFrame:
         "diff_from_expected",
         "situation_type",
         "situation_type_ko",
+        "is_normal",
         "type_id",
         "type_name",
         "process_id",
@@ -277,7 +298,8 @@ def scenario_report(df: pd.DataFrame) -> pd.DataFrame:
     grouped["type_name"] = grouped["type_id"].map(schema.accident_type_name)
     grouped["process_id"] = sid.map(schema.scenario_process_id)
     grouped["process_name"] = grouped["process_id"].map(schema.process_name)
-    grouped["description"] = sid.map(schema.scenario_description)
+    grouped["is_normal"] = sid.map(schema.is_normal)
+    grouped["description"] = sid.map(schema.describe)
     grouped["in_tables"] = sid.map(schema.is_known_situation)
     grouped["diff_from_expected"] = grouped["n_images"] - schema.EXPECTED_PER_SCENARIO
     # 기대값과 다른 type_ID 가 하나라도 섞여 있으면 불일치로 본다.
@@ -313,11 +335,11 @@ def pair_report(df: pd.DataFrame) -> pd.DataFrame:
             {
                 "pair": y_id.split("-", 1)[1],
                 "y_id": y_id,
-                "y_desc": schema.scenario_description(y_id),
+                "y_desc": schema.describe(y_id),
                 "y_n_images": y_n,
                 "y_diff_from_expected": y_n - expected,
                 "n_id": n_id,
-                "n_desc": schema.scenario_description(n_id),
+                "n_desc": schema.describe(n_id),
                 "n_n_images": n_n,
                 "n_diff_from_expected": n_n - expected,
                 "diff": y_n - n_n,
@@ -345,7 +367,7 @@ def missing_scenario_report(df: pd.DataFrame) -> pd.DataFrame:
                 "type_name": schema.accident_type_name(schema.scenario_type_id(sid)),
                 "process_id": schema.scenario_process_id(sid),
                 "process_name": schema.process_name(schema.scenario_process_id(sid)),
-                "description": schema.scenario_description(sid),
+                "description": schema.describe(sid),
             }
         )
     return pd.DataFrame(
@@ -536,6 +558,9 @@ def mobile_subset_text(labels_df: pd.DataFrame) -> str:
     for code, count in situ.items():
         ko = schema.SITUATION_TYPE_KO.get(str(code), "")
         lines.append(f"  {code} {ko:<10} {int(count):>8,}")
+    lines += ["", "정상/비정상 판정 (is_normal):"]
+    for label, n in _normal_counts(mobile).items():
+        lines.append(f"  {label:<12} {n:>8,}")
 
     types = _codes(mobile["type_id"]).value_counts()
     lines += ["", "사고유형별:"]
@@ -548,14 +573,11 @@ def mobile_subset_text(labels_df: pd.DataFrame) -> str:
         f"{len(schema.DEFINED_SITUATION_IDS)} 종",
         "",
         "시나리오별 (장수 내림차순):",
-        f"  {'situation_id':<14}{'n':>8}  {'type':<8}{'process':<14}description",
+        f"  {'situation_id':<14}{'n':>8}  사고유형 · 공정 · 설명",
     ]
     counts = _codes(mobile["situation_id"]).value_counts()
     for sid, count in counts.items():
-        type_name = schema.accident_type_name(schema.scenario_type_id(sid))
-        proc = schema.process_name(schema.scenario_process_id(sid))
-        desc = schema.scenario_description(sid)
-        lines.append(f"  {str(sid):<14}{int(count):>8,}  {type_name:<8}{proc:<14}{desc}")
+        lines.append(f"  {str(sid):<14}{int(count):>8,}  {schema.describe(sid)}")
 
     absent = [
         sid
@@ -635,6 +657,11 @@ def build_summary(
     for code, n in situ.items():
         if code not in ("Y", "N", "C", "SO"):
             L.append(f"  {code} {'(미정의)':<12} {n:>9,}  {pct(n)}")
+    normal_counts = _normal_counts(labels_df)
+    if normal_counts:
+        L.append("  -- tables.is_normal() 기준 --")
+        for label, n in normal_counts.items():
+            L.append(f"  {label:<24} {n:>9,}  {pct(n)}")
     L.append("")
     # 4. 공정별
     L.append("[4] 공정 (process_ID)")
@@ -751,6 +778,7 @@ def build_summary(
         "expected_per_scenario": schema.EXPECTED_PER_SCENARIO,
         "by_accident_type": types,
         "by_situation_type": situ,
+        "by_is_normal": _normal_counts(labels_df),
         "by_process": processes,
         "by_device": devices,
         "by_site_condition": site,

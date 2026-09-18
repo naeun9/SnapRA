@@ -153,10 +153,12 @@ for _cid, _entry in OBJECT_CLASSES.items():
 
 # 정의된 시나리오 ID 전체 / Y-N 쌍. 데이터가 아니라 tables.py 에서 유도한다.
 DEFINED_SITUATION_IDS: tuple[str, ...] = tuple(SCENARIOS)
+
+# 짝 찾기는 tables.scenario_pair() 가 단일 출처다 (쌍이 없으면 None).
 SCENARIO_PAIRS: list[tuple[str, str]] = [
-    (sid, f"N-{sid.split('-', 1)[1]}")
+    (sid, pair)
     for sid in sorted(SCENARIOS)
-    if sid.startswith("Y-") and f"N-{sid.split('-', 1)[1]}" in SCENARIOS
+    if sid.startswith("Y-") and (pair := tables.scenario_pair(sid)) in SCENARIOS
 ]
 
 
@@ -215,14 +217,35 @@ def situation_prefix(situation_id: str | None) -> str | None:
 
 
 def counterpart(situation_id: str | None) -> str | None:
-    """Y-03 <-> N-03. 쌍이 없는 코드면 None."""
-    if not isinstance(situation_id, str) or "-" not in situation_id:
+    """Y-03 <-> N-03. 쌍이 없으면 None. tables.scenario_pair() 에 위임한다."""
+    if not isinstance(situation_id, str):
         return None
-    prefix = situation_prefix(situation_id)
-    if prefix not in ("Y", "N"):
+    return tables.scenario_pair(situation_id.strip().upper())
+
+
+def is_normal(situation_id: str | None) -> bool | None:
+    """정상(Y) True / 비정상(N) False / 쌍이 없는 C·SO 는 None.
+
+    tables.is_normal() 에 위임한다. pandas NaN 같은 비문자열은 None.
+    """
+    if not isinstance(situation_id, str) or not situation_id:
         return None
-    number = situation_id.split("-", 1)[1]
-    return f"{'N' if prefix == 'Y' else 'Y'}-{number}"
+    return tables.is_normal(situation_id.strip().upper())
+
+
+def describe(code: str | None) -> str:
+    """'사고유형 · 공정 · 설명' 한 줄 설명. tables.describe() 에 위임한다.
+
+    tables.describe() 는 모르는 코드면 코드 자체를 돌려주므로, 테이블에 없는
+    값은 빈 문자열로 바꿔 리포트에 코드가 두 번 찍히지 않게 한다.
+    """
+    if not isinstance(code, str) or not code:
+        return ""
+    key = code.strip().upper()
+    text = tables.describe(key)
+    if not isinstance(text, str) or text.strip() == key:
+        return ""
+    return text.strip()
 
 
 def scenario_entry(situation_id: str | None) -> tuple | None:
@@ -512,7 +535,9 @@ class LabelRecord:
             "situation_id": r.Situation_ID,
             "situation_type": r.situation_type,
             "situation_type_ko": r.situation_type_ko,
+            "is_normal": is_normal(r.Situation_ID),
             "scenario_desc": scenario_description(r.Situation_ID),
+            "scenario_label": describe(r.Situation_ID),
             "known_situation": is_known_situation(r.Situation_ID),
             "type_id": r.type_ID,
             "type_ko": r.accident_type_ko or r.Type_Description,
