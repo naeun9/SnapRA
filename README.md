@@ -37,6 +37,10 @@
 ├── src/schema.py         JSON 어노테이션 스키마 — 테이블은 tables.py 에서 읽어 온다
 ├── src/parse_labels.py   JSON 일괄 파싱 → DataFrame → 분포 리포트
 ├── src/make_evalset.py   Validation 분할에서 VLM 평가셋 생성
+├── src/prompts.py        VLM 프롬프트 (Task B: 정상/비정상 판정)
+├── src/gemini.py         Gemini REST 래퍼 (리사이즈·재시도)
+├── src/run_eval.py       평가 실행 -> jsonl
+├── src/score_eval.py     채점 (정확도·혼동행렬·confidence)
 ├── scripts/fetch_eval_images.py  평가셋 이미지만 순차 스트리밍으로 확보
 ├── tests/test_tables.py  tables.py 개수·정합성 검증
 ├── tests/make_fixture.py 실데이터 없이 돌려보는 가짜 라벨 생성기
@@ -214,6 +218,48 @@ python scripts/fetch_eval_images.py             # 실행 (중단해도 이어서
 
 진행 상태는 `data/raw/images/_progress.json` 에 남아 재시작 시 끝난 zip 을 건너뛴다.
 Training 원천데이터(226 GB)는 받지 않는다.
+
+## VLM 판정 (Gemini)
+
+모델을 학습시키지 않는다. Gemini 에 프롬프트로 판정시키고 AI-Hub 라벨을 정답지로 삼아
+정확도를 측정한다.
+
+```bash
+# .env 에 GEMINI_API_KEY 기입 (https://aistudio.google.com/apikey)
+python src/run_eval.py --set eval_smoke --limit 20 --balance --dry-run   # 대상 확인
+python src/run_eval.py --set eval_smoke --limit 20 --balance             # 실행
+python src/score_eval.py --run eval_smoke_task_b.v1 --rows               # 채점
+```
+
+| 파일 | 역할 |
+| --- | --- |
+| `src/prompts.py` | 프롬프트 정의. Task B(정상/비정상 판정)와 응답 스키마 |
+| `src/gemini.py` | Gemini REST 래퍼. 리사이즈·재시도·토큰 집계 |
+| `src/run_eval.py` | 평가셋 실행. 결과를 jsonl 로 적재 (중단 후 재실행 안전) |
+| `src/score_eval.py` | 채점. 정확도·혼동행렬·confidence 분포·파싱 실패 |
+
+과제 구분: **Task A** 관찰(미구현) / **Task B** 정상·비정상 판정 / **Task C** 평가표 초안(미구현).
+
+### 호출 설정
+
+- 모델 기본값 `gemini-3.8-flash` (`.env` 의 `GEMINI_MODEL` 로 변경)
+- 이미지는 **긴 변 1024px** 로 리사이즈해 전송 (원본 1920×1080 → 약 1.1 MB에서 140 KB)
+- `temperature=0` 고정 — 같은 사진에 같은 판정이 나와야 평가가 의미 있다
+- 구조화 출력(`responseSchema`) 사용. 자유형식 JSON 파싱 안정성을 측정하려면 `--no-schema`
+- `--rpm` 으로 분당 호출을 제한하고, 429 는 `Retry-After` 를 따라 물러난다
+- 의존성은 `requests` + `pillow` 만 쓴다 (google-genai SDK 미사용)
+
+### 무료 티어 주의 — 입력이 Google 제품 개선에 사용됨
+
+Gemini API **무료 티어는 입력·출력이 Google 제품 개선에 사용된다**
+(공식 가격 문서의 "Content used to improve our products: Yes"). 유료 티어는 사용되지 않는다.
+
+지금 보내는 것은 AI-Hub 가 공개 배포하는 데이터셋 이미지이므로 이 조건으로 평가해도
+문제가 없다. 다만 **실제 현장 사진을 받는 서비스로 확장하면 유료 티어로 올려야 한다** —
+현장 사진은 공개 데이터가 아니고, 업로드한 사용자의 자산이다.
+
+RPM/TPM/RPD 한도는 계정·모델별로 다르고 공식 문서가 고정 수치를 싣지 않는다. 본인 계정의
+한도는 [AI Studio 대시보드](https://aistudio.google.com/rate-limit)에서 확인한다.
 
 ## 코드 테이블
 

@@ -6,3 +6,7 @@ python-dotenv>=1.0   # .env 로드
 
 # 선택: tests/ 실행용. 없으면 python tests/test_tables.py 로 단독 실행된다.
 pytest>=8.0
+
+# VLM 호출 (Gemini REST). google-genai SDK 는 쓰지 않는다 - 의존성 최소화
+requests>=2.31
+pillow>=10.0         # 이미지 리사이즈 (긴 변 1024px)
