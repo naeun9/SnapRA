@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config  # noqa: E402
 import gemini  # noqa: E402
 import prompts  # noqa: E402
+import schema  # noqa: E402
 
 try:
     import pandas as pd
@@ -55,8 +56,19 @@ def load_set(name: str) -> pd.DataFrame:
     return df
 
 
-def pick(df: pd.DataFrame, limit: int | None, balance: bool, seed: int) -> pd.DataFrame:
-    """평가 대상 선택. balance 면 정상/비정상 같은 수로."""
+def pick(
+    df: pd.DataFrame,
+    limit: int | None,
+    balance: bool,
+    seed: int,
+    by_type: bool = False,
+) -> pd.DataFrame:
+    """평가 대상 선택.
+
+    balance   정상/비정상 같은 수로
+    by_type   5대 사고유형(A~E)에 고르게 — 유형별로 정상/비정상 반반
+              한 유형에 몰려 있으면 유형별 성능 비교가 안 되므로 스모크에 쓴다.
+    """
     available = df[df.exists].copy()
     if not balance:
         return available if limit is None else available.sample(
@@ -66,18 +78,38 @@ def pick(df: pd.DataFrame, limit: int | None, balance: bool, seed: int) -> pd.Da
     # is_normal 은 csv 에서 True/False/빈값(C·SO 계열)으로 들어온다
     normal = available[available.is_normal == True]  # noqa: E712
     abnormal = available[available.is_normal == False]  # noqa: E712
-    half = (limit or (len(normal) + len(abnormal))) // 2
-    half_n = min(half, len(normal))
-    half_a = min(half, len(abnormal))
-    if half_n != half_a:
-        half_n = half_a = min(half_n, half_a)
-    picked = pd.concat(
-        [
-            normal.sample(n=half_n, random_state=seed),
-            abnormal.sample(n=half_a, random_state=seed),
-        ]
-    )
-    return picked.sort_values(["situation_id", "image_file"])
+
+    if not by_type:
+        half = (limit or (len(normal) + len(abnormal))) // 2
+        half_n = half_a = min(half, len(normal), len(abnormal))
+        picked = pd.concat(
+            [
+                normal.sample(n=half_n, random_state=seed),
+                abnormal.sample(n=half_a, random_state=seed),
+            ]
+        )
+        return picked.sort_values(["situation_id", "image_file"])
+
+    # 5대 사고유형 x 정상/비정상 = 10칸. limit 를 10칸에 고르게 나눈다.
+    types = [t for t in schema.MAJOR_ACCIDENT_TYPES if (available.type_id == t).any()]
+    if not types:
+        raise SystemExit("5대 사고유형(A~E) 이미지가 없다.")
+    per_cell = max((limit or len(available)) // (len(types) * 2), 1)
+
+    frames = []
+    for type_id in types:
+        for pool in (normal, abnormal):
+            cell = pool[pool.type_id == type_id]
+            if cell.empty:
+                continue
+            # 같은 시나리오만 뽑히지 않게 시나리오를 먼저 섞고 1장씩 돌아가며 뽑는다
+            shuffled = cell.sample(frac=1.0, random_state=seed)
+            shuffled = shuffled.assign(
+                _rank=shuffled.groupby("situation_id").cumcount()
+            ).sort_values(["_rank", "situation_id"])
+            frames.append(shuffled.head(per_cell).drop(columns=["_rank"]))
+    picked = pd.concat(frames) if frames else available.iloc[0:0]
+    return picked.sort_values(["type_id", "situation_id", "image_file"])
 
 
 def done_images(run_path: Path) -> set[str]:
@@ -97,6 +129,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--set", default="eval_smoke", help="평가셋 이름 (기본 eval_smoke)")
     parser.add_argument("--limit", type=int, default=20, help="최대 호출 수 (기본 20)")
     parser.add_argument("--balance", action="store_true", help="정상/비정상 같은 수로 뽑기")
+    parser.add_argument(
+        "--by-type",
+        action="store_true",
+        help="5대 사고유형(A~E)에 고르게 분배 (--balance 와 함께 쓴다)",
+    )
     parser.add_argument("--run-name", default=None, help="결과 파일 이름 (기본: 세트_프롬프트버전)")
     parser.add_argument("--rpm", type=float, default=10.0, help="분당 호출 상한 (기본 10)")
     parser.add_argument("--model", default=None, help=f"모델 (기본 {gemini.DEFAULT_MODEL})")
@@ -117,7 +154,7 @@ def main(argv: list[str] | None = None) -> None:
     if missing:
         print(f"      이미지 없는 항목은 건너뛴다 (python scripts/fetch_eval_images.py 로 확보)")
 
-    targets = pick(df, args.limit, args.balance, args.seed)
+    targets = pick(df, args.limit, args.balance, args.seed, by_type=args.by_type)
     already = done_images(run_path)
     if already:
         targets = targets[~targets.image_file.isin(already)]
@@ -126,6 +163,16 @@ def main(argv: list[str] | None = None) -> None:
     truth = targets.is_normal.map(prompts.truth_label)
     print(f"[2/3] 호출 대상 {len(targets)} 건")
     print(f"      정답 구성: 정상 {int((truth == '정상').sum())} / 비정상 {int((truth == '비정상').sum())} / 판정대상 아님 {int((truth == '').sum())}")
+    if len(targets):
+        by_type_counts = targets.groupby("type_id").size()
+        print(
+            "      사고유형: "
+            + " / ".join(
+                f"{t} {schema.accident_type_name(t)} {n}" for t, n in by_type_counts.items()
+            )
+        )
+        print(f"      시나리오 {targets.situation_id.nunique()} 종 / 촬영장비 "
+              + ", ".join(f"{k}={v}" for k, v in targets.device.astype(str).value_counts().sort_index().items()))
     print(f"      모델 {model} / 프롬프트 {prompt['version']} / 구조화출력 {'off' if args.no_schema else 'on'}")
     print(f"      리사이즈 긴 변 {args.long_edge}px / temperature 0 / RPM 상한 {args.rpm}")
     est_min = len(targets) / args.rpm if args.rpm else 0
