@@ -50,6 +50,54 @@ for _stream in (sys.stdout, sys.stderr):
 RUN_DIR = config.PROCESSED_DIR / "eval_runs"
 OUT_DIR = config.PROCESSED_DIR / "assessment"
 
+# ---------------------------------------------------- 개선대책 문구 변환
+# Y 설명은 "목표 상태"를 적은 것이라 대부분 그대로 조치 문구가 된다(설치/배치/작업).
+# 다만 부정 표현으로 끝나는 4종은 행동 지시문으로 읽히지 않는다("미배치" = 치우라는 뜻).
+# Y 50종을 전수 확인해 변환이 필요한 것만 명시적으로 박아 둔다. 규칙 기반 자동 변환이
+# 아니라 손으로 고른 표다 — 자동 치환은 "사다리 최상단 밑단에서 작업"처럼 부정어가
+# 없는데도 어색한 문구를 건드려 뜻을 바꿀 위험이 있다.
+#
+# 적용 규칙 (사용자 승인):
+#   미배치 -> 배치 금지 / 제거
+#   미사용 -> 사용 중지
+#   미설치 -> 설치 금지 / 제거
+#
+# 원문은 버리지 않는다. 근거 열에 "Y-11 (시스템 비계 위 낙하 위험물 미배치)" 형태로
+# 병기하므로 열이 늘어나지 않으면서 인용 근거가 남는다.
+MEASURE_OVERRIDES: dict[str, str] = {
+    "Y-08": "이동식 비계 발판 위 간이 사다리 설치 금지 / 제거",
+    "Y-11": "시스템 비계 위 낙하 위험물 배치 금지 / 제거",
+    "Y-15": "거푸집 단부 위 적재물 배치 금지 / 제거",
+    "Y-32": "실내 마감 작업 시 근처 난로 설치 금지 / 제거",
+}
+
+# 변환이 필요한지 자동 탐지하는 데 쓰는 부정 표현. tables.py 가 바뀌어 새로운 부정
+# 표현이 들어오면 MEASURE_OVERRIDES 에 없다는 것을 경고로 알린다(조용히 넘기지 않는다).
+NEGATIVE_MARKERS = ("미배치", "미사용", "미설치", "미흡", "않은", "않는", "없는")
+
+
+def measure_text(pair_id: str | None) -> tuple[str, bool]:
+    """Y-nn -> 개선대책 문구. (문구, 변환했는지)."""
+    if not pair_id:
+        return "", False
+    original = schema.scenario_description(pair_id)
+    if pair_id in MEASURE_OVERRIDES:
+        return MEASURE_OVERRIDES[pair_id], True
+    return original, False
+
+
+def uncovered_negatives() -> list[tuple[str, str]]:
+    """부정 표현이 있는데 변환표에 없는 Y 시나리오. 비어 있어야 정상."""
+    out = []
+    for sid in schema.DEFINED_SITUATION_IDS:
+        if not sid.startswith("Y-") or sid in MEASURE_OVERRIDES:
+            continue
+        desc = schema.scenario_description(sid)
+        if any(marker in desc for marker in NEGATIVE_MARKERS):
+            out.append((sid, desc))
+    return out
+
+
 # 사업장 프로파일 최소 필드. 지금은 표 머리글과 담당자 칸을 채우는 데만 쓴다.
 DEFAULT_PROFILE: dict[str, Any] = {
     "site_name": "(사업장명 미입력)",
@@ -124,6 +172,9 @@ def demo_judgments() -> list[dict[str, Any]]:
         ("N-11", 0.61, "시스템 비계 작업발판 위에 각재와 공구가 쌓여 있고 일부가 발판 바깥으로 나와 있다."),
         ("N-48", 0.74, "오거 크레인이 천공 작업 중이고 선회 반경 내에 작업자가 있다. 신호수는 확인되지 않는다."),
         ("N-05", 0.45, "건물 외벽 단부에 안전난간 지주는 세워져 있으나 중간대가 일부 누락돼 있다. 화질이 낮아 전체 구간은 확인 어렵다."),
+        # 아래 2건은 개선대책 문구 변환(Y-15 / Y-08)이 어떻게 나오는지 보기 위한 것
+        ("N-15", 0.9, "거푸집 단부 위에 각재 묶음이 적재돼 있고 하부에 작업자가 통행한다."),
+        ("N-08", 0.83, "이동식 비계 작업발판 위에 A형 간이 사다리를 올려놓고 작업자가 올라서 있다."),
     ]
     records = []
     for i, (sid, conf, observed) in enumerate(samples):
@@ -197,7 +248,8 @@ def build_rows(
         # ---- 핵심: N-nn -> Y-nn 으로 목표 상태를 끌어온다 ----
         pair_id = schema.counterpart(situation_id)  # tables.scenario_pair() 위임
         hazard = schema.scenario_description(situation_id)
-        measure = schema.scenario_description(pair_id) if pair_id else ""
+        measure, converted = measure_text(pair_id)
+        pair_original = schema.scenario_description(pair_id) if pair_id else ""
 
         type_id = schema.scenario_type_id(situation_id)
         process_id = schema.scenario_process_id(situation_id)
@@ -221,9 +273,14 @@ def build_rows(
                 "개선대책": measure,
                 "담당": profile.get("assessor", ""),
                 "기한": risk.action_deadline if judgment == "비정상" else "현장 확인 후 확정",
-                # TODO: 산업안전보건기준에 관한 규칙 조항 매핑. 지금은 시나리오 ID 와 유형만.
-                "근거": f"{situation_id} / {schema.accident_type_name(type_id)} / 목표상태 {pair_id or '-'}"
-                        f" (산안법 조항 매핑 TODO)",
+                # 목표 상태의 원문을 병기한다. 개선대책 칸이 변환된 문구여도 인용
+                # 근거가 남는다. TODO: 산업안전보건기준에 관한 규칙 조항 매핑.
+                "근거": (
+                    f"{situation_id} ({hazard}) / {schema.accident_type_name(type_id)} / "
+                    f"{pair_id or '-'} ({pair_original})"
+                    + (" [조치 문구로 변환]" if converted else "")
+                    + " / 산안법 조항 매핑 TODO"
+                ),
                 "신뢰도": risk.confidence_grade,
                 "검토필요": "Y" if risk.needs_review else "",
                 "검토사유": risk.review_reason,
@@ -332,13 +389,26 @@ def render_text(df: pd.DataFrame, profile: dict[str, Any], run: str) -> str:
         L.append(f"  {rule['축']} {rule['값']}  {rule['분류']:<24} {rule['근거']}")
     L += [
         "",
+        "  ※ 강도에 관한 명시 사항",
+        f"    {risk_scoring.SEVERITY_UNIFORM_NOTE}",
+        "",
         "  · confidence 는 위험성 점수에 넣지 않는다. 측정 신뢰도와 위험 속성은 다른 축이고,",
         "    곱하면 '확신이 없으니 위험이 낮다'는 잘못된 결론이 나온다. 대신 신뢰도 등급과",
         "    검토필요 플래그로 분리한다.",
         "  · 작업 높이·중량 정보가 입력에 없어 강도를 더 세분할 수 없다. 고층 작업이 많은",
         "    현장은 강도를 상향 조정해야 한다.",
+        "  · 개선대책은 목표 상태(Y-nn) 문구를 그대로 쓴다. 부정 표현으로 끝나 행동",
+        "    지시문이 되지 않는 4종만 조치 문구로 변환했고, 원문은 근거 칸에 병기했다.",
         "  · 산업안전보건기준에 관한 규칙 조항 매핑은 아직 없다(근거 칸 TODO).",
     ]
+    uncovered = uncovered_negatives()
+    if uncovered:
+        L += [
+            "",
+            f"  [경고] 부정 표현이 있으나 변환표에 없는 Y 시나리오 {len(uncovered)}종:",
+        ]
+        for sid, desc in uncovered:
+            L.append(f"    {sid}: {desc}")
     return "\n".join(L) + "\n"
 
 
