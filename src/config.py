@@ -25,6 +25,22 @@ PARSE_ERRORS_CSV = REPORT_DIR / "parse_errors.csv"
 
 ENV_FILE = PROJECT_ROOT / ".env"
 
+# ---------------------------------------------------------- 평가 호출 설정
+# 한 곳에 모아 둔다. 스모크와 본평가의 설정이 달라지면 비교가 무효가 되므로,
+# 실행할 때마다 결과 파일 옆에 .meta.json 으로 스냅샷을 남긴다.
+#
+# EVAL_SEED: Interactions API 에는 temperature 가 없고 generation_config.seed 로
+#   재현성을 요구한다. make_evalset.py 의 표본 추출 시드와 같은 값을 쓴다.
+#   주의: seed 고정이 결정성을 "보장"한다고 문서가 명시하지 않는다. 실제로 같은
+#   응답이 나오는지는 run_eval.py --determinism-check 로 확인한다.
+EVAL_SEED = 20260918
+
+# 판정 과제에 긴 사고는 필요 없다. minimal/low/medium/high 중 low.
+EVAL_THINKING_LEVEL = "low"
+
+# 응답 상한. 우리 스키마는 200 토큰이면 충분하고, 상한을 명시해야 설정이 고정된다.
+EVAL_MAX_OUTPUT_TOKENS = 1024
+
 
 def ensure_dirs() -> None:
     for d in (RAW_DIR, PROCESSED_DIR, REPORT_DIR):

@@ -1,4 +1,4 @@
-"""평가셋 이미지를 Gemini 에 보내 Task B(정상/비정상 판정)를 받는다.
+﻿"""평가셋 이미지를 Gemini 에 보내 Task B(정상/비정상 판정)를 받는다.
 
     python src/run_eval.py --set eval_smoke --limit 20 --balance --dry-run
     python src/run_eval.py --set eval_smoke --limit 20 --balance
@@ -113,15 +113,95 @@ def pick(
 
 
 def done_images(run_path: Path) -> set[str]:
+    """이미 '성공'한 이미지만 건너뛴다.
+
+    503 같은 인프라 실패로 끝난 레코드는 판정을 얻지 못한 것이므로 다시 호출해야
+    한다. 실패까지 건너뛰면 재실행해도 영영 비어 있는 칸이 남는다.
+    """
     if not run_path.exists():
         return set()
     seen = set()
     for line in run_path.read_text(encoding="utf-8").splitlines():
         try:
-            seen.add(json.loads(line)["image_file"])
-        except (json.JSONDecodeError, KeyError):
+            record = json.loads(line)
+        except json.JSONDecodeError:
             continue
+        if record.get("ok") and record.get("image_file"):
+            seen.add(record["image_file"])
     return seen
+
+
+def determinism_check(args, model: str, prompt: dict, run_path: Path) -> None:
+    """같은 이미지를 1회 더 호출해 기존 jsonl 결과와 비교한다.
+
+    Interactions API 의 seed 가 결정성을 보장한다고 문서가 명시하지 않는다.
+    보장되지 않으면 그 사실 자체가 결과보고서에 적어야 할 한계다.
+    """
+    image_file = args.determinism_check
+    previous = None
+    if run_path.exists():
+        for line in run_path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("image_file") == image_file and rec.get("ok"):
+                previous = rec
+    if previous is None:
+        raise SystemExit(f"{run_path.name} 에 {image_file} 의 성공 결과가 없다.")
+
+    path = IMAGE_DIR / image_file
+    print(f"[결정성 확인] {image_file}")
+    print(f"  seed={config.EVAL_SEED} / thinking={config.EVAL_THINKING_LEVEL} / model={model}")
+    usage = gemini.Usage()
+    result = gemini.generate(path, prompt, key=gemini.api_key(), model=model,
+                             long_edge=args.long_edge, usage=usage)
+    if not result.ok:
+        print(f"  재호출 실패: {result.error}")
+        return
+
+    before, after = previous.get("raw_text", ""), result.text
+    same_raw = before.strip() == after.strip()
+    pb, pa = previous.get("parsed") or {}, result.parsed or {}
+    same_judgment = pb.get("judgment") == pa.get("judgment")
+    same_conf = pb.get("confidence") == pa.get("confidence")
+
+    print(f"\n  1회차 judgment={pb.get('judgment')} conf={pb.get('confidence')}")
+    print(f"  2회차 judgment={pa.get('judgment')} conf={pa.get('confidence')}")
+    print(f"\n  raw_text 완전 일치 : {same_raw}")
+    print(f"  judgment 일치      : {same_judgment}")
+    print(f"  confidence 일치    : {same_conf}")
+    if not same_raw:
+        print("\n  --- 1회차 observed ---")
+        print(f"  {pb.get('observed', '')}")
+        print("  --- 2회차 observed ---")
+        print(f"  {pa.get('observed', '')}")
+
+    out = run_path.with_name(run_path.stem + ".determinism.json")
+    out.write_text(
+        json.dumps(
+            {
+                "image_file": image_file,
+                "seed": config.EVAL_SEED,
+                "model_requested": model,
+                "model_responded_1": previous.get("model_responded"),
+                "model_responded_2": result.model_responded,
+                "same_raw_text": same_raw,
+                "same_judgment": same_judgment,
+                "same_confidence": same_conf,
+                "first": pb,
+                "second": pa,
+                "first_raw": before,
+                "second_raw": after,
+                "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"\n  기록 -> {out.name}")
+    print(f"  {usage.summary()}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -140,6 +220,24 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--long-edge", type=int, default=gemini.DEFAULT_LONG_EDGE, help="리사이즈 긴 변 (기본 1024)")
     parser.add_argument("--no-schema", action="store_true", help="구조화 출력 끄기 (자유형식 JSON 파싱 측정용)")
     parser.add_argument("--dry-run", action="store_true", help="호출하지 않고 대상만 출력")
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=gemini.DEFAULT_MAX_RETRIES,
+        help=f"호출당 최대 시도 수 (기본 {gemini.DEFAULT_MAX_RETRIES}, 최초 시도 포함)",
+    )
+    parser.add_argument(
+        "--max-consecutive-errors",
+        type=int,
+        default=5,
+        help="연속 호출 실패가 이 수에 도달하면 중단 (기본 5). 0 이면 끝까지 진행",
+    )
+    parser.add_argument(
+        "--determinism-check",
+        metavar="IMAGE_FILE",
+        default=None,
+        help="이 이미지를 1회 더 호출해 기존 결과와 같은 응답인지 확인 (호출 1건)",
+    )
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args(argv)
 
@@ -147,6 +245,10 @@ def main(argv: list[str] | None = None) -> None:
     prompt = prompts.task_b(use_schema=not args.no_schema)
     run_name = args.run_name or f"{args.set}_{prompt['version']}"
     run_path = RUN_DIR / f"{run_name}.jsonl"
+
+    if args.determinism_check:
+        determinism_check(args, model, prompt, run_path)
+        return
 
     df = load_set(args.set)
     missing = int((~df.exists).sum())
@@ -174,7 +276,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"      시나리오 {targets.situation_id.nunique()} 종 / 촬영장비 "
               + ", ".join(f"{k}={v}" for k, v in targets.device.astype(str).value_counts().sort_index().items()))
     print(f"      모델 {model} / 프롬프트 {prompt['version']} / 구조화출력 {'off' if args.no_schema else 'on'}")
-    print(f"      리사이즈 긴 변 {args.long_edge}px / temperature 0 / RPM 상한 {args.rpm}")
+    print(f"      리사이즈 긴 변 {args.long_edge}px / seed 고정 / RPM 상한 {args.rpm}")
+    print(f"      호출당 최대 시도 {args.max_retries} / 연속 실패 {args.max_consecutive_errors}건이면 중단")
     est_min = len(targets) / args.rpm if args.rpm else 0
     print(f"      예상 소요 {est_min:.1f} 분 (RPM 상한 기준) / 호출 {len(targets)} 회 = RPD 소모 {len(targets)}")
 
@@ -190,10 +293,44 @@ def main(argv: list[str] | None = None) -> None:
 
     key = gemini.api_key()
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 설정 스냅샷. 스모크와 본평가의 설정이 달라지면 비교가 무효가 되므로 남긴다.
+    meta_path = RUN_DIR / f"{run_name}.meta.json"
+    snapshot = gemini.config_snapshot(
+        model,
+        prompt,
+        long_edge=args.long_edge,
+        seed=config.EVAL_SEED,
+        thinking_level=config.EVAL_THINKING_LEVEL,
+        max_output_tokens=config.EVAL_MAX_OUTPUT_TOKENS,
+    )
+    snapshot.update(
+        {
+            "run_name": run_name,
+            "eval_set": args.set,
+            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "n_images_planned": len(targets),
+            "n_images_already_done": len(already),
+            "rpm_limit": args.rpm,
+            "max_retries": args.max_retries,
+            "sampling": {
+                "limit": args.limit,
+                "balance": args.balance,
+                "by_type": args.by_type,
+                "seed": args.seed,
+            },
+        }
+    )
+    meta_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"      설정 스냅샷 -> {meta_path.name}")
     usage = gemini.Usage()
     interval = 60.0 / args.rpm if args.rpm else 0.0
     n_fail = 0
     n_parse_fail = 0
+    consecutive_errors = 0
+    stopped_early = False
 
     print(f"\n[3/3] 호출 시작 -> {run_path.relative_to(config.PROJECT_ROOT)}")
     with run_path.open("a", encoding="utf-8") as out:
@@ -205,8 +342,19 @@ def main(argv: list[str] | None = None) -> None:
                 key=key,
                 model=model,
                 long_edge=args.long_edge,
+                max_retries=args.max_retries,
                 usage=usage,
             )
+            # 503 등 인프라 실패와 모델의 "판단불가"는 전혀 다른 것이다.
+            # status 로 한 칸에 섞이지 않게 분리해 둔다.
+            parsed = result.parsed or {}
+            if not result.ok:
+                status = "error"          # 호출 자체가 실패 (인프라)
+            elif result.parse_error:
+                status = "parse_error"    # 응답은 왔는데 JSON 이 아님
+            else:
+                status = "judged"         # 판정을 받음 (판단불가도 여기에 포함)
+
             record = {
                 "image_file": row.image_file,
                 "situation_id": row.situation_id,
@@ -215,14 +363,23 @@ def main(argv: list[str] | None = None) -> None:
                 "type_id": row.type_id,
                 "device": int(row.device) if str(row.device).isdigit() else row.device,
                 "eval_set": args.set,
-                "model": model,
+                "status": status,
+                "judgment": parsed.get("judgment"),  # 판단불가는 여기, 인프라 실패는 status
+                "model": model,                      # 요청한 모델
+                "model_responded": result.model_responded,  # 응답이 밝힌 모델 (혼용 검사용)
                 "prompt_version": prompt["version"],
+                "seed": config.EVAL_SEED,
+                "thinking_level": config.EVAL_THINKING_LEVEL,
+                "max_output_tokens": config.EVAL_MAX_OUTPUT_TOKENS,
                 "schema": not args.no_schema,
                 "long_edge": args.long_edge,
                 "ok": result.ok,
                 "error": result.error,
                 "finish_reason": result.finish_reason,
                 "attempts": result.attempts,
+                "retry_waits": result.retry_waits,
+                "retry_after_seen": result.retry_after_seen,
+                "quota_headers": result.quota_headers,
                 "elapsed_sec": round(result.elapsed, 2),
                 "usage": result.usage,
                 "raw_text": result.text,
@@ -233,26 +390,40 @@ def main(argv: list[str] | None = None) -> None:
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()
 
+            retry_note = f" 재시도{result.attempts - 1}" if result.attempts > 1 else ""
             if not result.ok:
                 n_fail += 1
-                print(f"  ({i}/{len(targets)}) {row.image_file} 실패: {result.error}")
+                consecutive_errors += 1
+                print(f"  ({i}/{len(targets)}) {row.image_file} 호출실패{retry_note}: {result.error[:120]}")
             else:
                 if result.parse_error:
                     n_parse_fail += 1
                 judgment = (result.parsed or {}).get("judgment", "?")
                 conf = (result.parsed or {}).get("confidence", "?")
+                consecutive_errors = 0
                 mark = "O" if judgment == record["truth"] else "X"
                 print(
                     f"  ({i}/{len(targets)}) {row.image_file[:34]:<34} "
                     f"정답={record['truth'] or '-':<4} 판정={judgment:<5} conf={conf} {mark} "
-                    f"{result.elapsed:.1f}초"
+                    f"{result.elapsed:.1f}초{retry_note}"
                 )
+
+            # 503 이 이어지면 재시도로 한도만 태운다. 일정 수 연속 실패하면 멈춘다.
+            if args.max_consecutive_errors and consecutive_errors >= args.max_consecutive_errors:
+                stopped_early = True
+                print(
+                    f"\n  !! 연속 호출 실패 {consecutive_errors}건 — 중단한다."
+                    f" 남은 {len(targets) - i}건은 나중에 재실행하면 이어서 처리된다."
+                )
+                break
 
             if i < len(targets) and interval:
                 time.sleep(max(0.0, interval - (time.time() - started)))
 
     print(f"\n{usage.summary()}")
-    print(f"호출 실패 {n_fail} / JSON 파싱 실패 {n_parse_fail} / 총 {len(targets)}")
+    print(f"호출 실패(인프라) {n_fail} / JSON 파싱 실패 {n_parse_fail} / 총 {len(targets)}")
+    if stopped_early:
+        print("중단됨: 연속 실패 한계 도달. 같은 명령을 다시 실행하면 성공분은 건너뛰고 이어서 돈다.")
     print(f"결과: {run_path.relative_to(config.PROJECT_ROOT)}")
     print(f"채점: python src/score_eval.py --run {run_name}")
 

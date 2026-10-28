@@ -187,6 +187,17 @@ def process_one(
         zip_path.unlink(missing_ok=True)
         return
 
+    # 다운로드가 성공해도 원하는 이미지를 하나도 못 꺼냈다면 실패로 본다.
+    # done 으로 남기면 재실행 때 조용히 건너뛰어 그 zip 의 이미지가 영구 누락된다.
+    if extracted == 0 and wanted:
+        progress["failed"][zip_name] = (
+            f"다운로드는 됐으나 추출 0건 (필요 {len(wanted)}장). zip 내용과 목록이 어긋난다."
+        )
+        save_progress(progress)
+        print(f"      추출 0/{len(wanted)} 장 — failed 로 기록 (재실행 시 다시 시도)")
+        zip_path.unlink(missing_ok=True)
+        return
+
     # zip 은 바로 버린다. 이게 이 스크립트의 존재 이유다.
     zip_path.unlink(missing_ok=True)
     # aihubshell 이 만든 빈 디렉터리 정리
@@ -206,6 +217,10 @@ def process_one(
     }
     if missing:
         progress["done"][zip_name]["missing"] = missing[:20]
+        # 일부만 빠진 경우는 done 으로 두되(재다운로드해도 같은 결과다) 경고를 남긴다.
+        progress["done"][zip_name]["warning"] = (
+            f"추출 {extracted}/{len(wanted)} — zip 에 없는 파일이 {len(missing)}장 있다"
+        )
     save_progress(progress)
     mark = "" if not missing else f"  (zip 에 없던 파일 {len(missing)} 장)"
     print(f"      추출 {extracted}/{len(wanted)} 장 / {elapsed:.0f}초{mark}")
